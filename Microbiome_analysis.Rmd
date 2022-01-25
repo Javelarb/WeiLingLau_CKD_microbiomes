@@ -1,0 +1,722 @@
+---
+title: "Lau_microbiome"
+author: "Julio Avelar-Barragan"
+date: "01/24/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, cache = F)
+options(scipen=10000, digits = 12)
+set.seed(seed = 999)
+```
+
+![](Screenshot from 2021-09-27 12-14-21.png)
+![](Screenshot from 2021-09-27 12-15-13.png)
+Summary:  
+![](Screenshot from 2021-09-28 12-45-05.png)
+# Analysis  
+
+Load packages.  
+```{r include=FALSE}
+library(tidyverse)
+library(vegan)
+library(biomformat)
+library(EcolUtils)
+library(RColorBrewer)
+library(nlme)
+library(LDM)
+library(ggpubr)
+
+setwd("/media/julio/Storage/Lau/")
+```
+
+## Filtering
+
+Convert OTU table from biom.    
+```{r}
+biom_table = read_hdf5_biom("feature-table.biom") %>% write_biom(., "formatted_biom.biom")
+biom_table = read_biom("formatted_biom.biom")
+OTU_table = as.data.frame(as.matrix(biom_data(biom_table)))
+```
+
+Read in taxonomy and metadata. 
+```{r}
+metadata = read.delim("metadata.tsv", check.names = F)
+taxonomy = read.delim("taxonomy.tsv", check.names = F, row.names = 1)
+```
+
+Merge OTU table with taxonomy and filter.  
+```{r}
+OTU_filtered = merge(taxonomy, OTU_table, by = "row.names") %>% filter(grepl("d__Bacteria", Taxon)) %>% filter(!grepl("Chloroplast", Taxon)) %>% filter(!grepl("Mitochondria", Taxon)) %>%  select(!c(Taxon,Confidence))
+#write.table(OTU_filtered, file = "Filtered_ASV_table.tsv", sep = "\t", quote = F, row.names = F, col.names = T)
+OTU_filtered = OTU_filtered %>% column_to_rownames(var = "Row.names")
+```
+
+## Rarefaction curve
+
+A vertical line was drawn at 4,300 (the rarefaction point).  
+A horizontal lines is drawn for every sample (each line) if it intersects 35,000 reads.  
+Labels are hidden because they become overwhelming.  
+```{r}
+rarecurve(t(OTU_filtered), step = 1000, label = F, sample = 4300, xlab = "Read Depth", col = "orange")
+```
+
+Rarefaction point was determined at 35,000 reads.  
+## New rarefaction depth for the analysis below is 4300 reads.  
+
+Eight samples are lost as a result, but they are from ABX treated groups so it makes sense that they have low read counts.  
+```{r eval=FALSE, include=FALSE}
+sort(colSums(OTU_filtered))
+
+as.data.frame(sort(colSums(OTU_filtered))) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid") %>% rename(Read_counts = `sort(colSums(OTU_filtered))`) %>% select(Row.names, Read_counts, sample, Treatment) %>% arrange(Read_counts) %>% filter(Read_counts < 35000)
+```
+
+```{r eval=FALSE, include=FALSE}
+as.data.frame(sort(colSums(OTU_filtered))) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid") %>% rename(Read_counts = `sort(colSums(OTU_filtered))`) %>% select(Row.names, Read_counts, sample, Treatment) %>% arrange(desc(Read_counts)) %>% slice_max(Read_counts, n = 10)
+```
+
+## Rarefy
+```{r include=FALSE}
+#Permutational rarefaction from ecolutils
+rd = 4300
+rared_OTU = as.data.frame((rrarefy.perm(t(OTU_filtered), sample = rd, n = 10, round.out = T)))
+```
+
+```{r}
+rared_OTU = as.data.frame(rared_OTU[rowSums(rared_OTU) >= rd-(rd*.1), colSums(rared_OTU) >= 2]) #Leaves out singletons too.
+
+rared_OTU = rared_OTU[!rownames(rared_OTU) %in% c("PrNotRecog", "P010"),] %>% rownames_to_column() #Get rid of mock and error sample
+write.table(t(rared_OTU), file = "Filtered_rarefied_ASV_table.tsv", sep = "\t", quote = F, row.names = T, col.names = F)
+rared_OTU = rared_OTU %>% column_to_rownames(var = "rowname")
+```
+
+Average number of ASVs per sample per treatment.  
+This includes both sexes per treatment.  
+```{r}
+ASV_means = reshape2::melt(as.matrix(rared_OTU)) %>% filter(!value == 0) %>% count(Var1) %>% merge(., metadata, by.x = "Var1", by. = "sampleid") %>% group_by(Treatment) %>% summarise(mean_ASVs = round(mean(n)))
+  
+ASV_means
+```
+
+## Alpha diversity
+
+### Males only
+
+Shannon diversity.  
+```{r}
+alpha_df = as.data.frame(diversity(rared_OTU, index = "shannon")) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+names(alpha_df)[2] = "Shannon"
+
+alpha_male = alpha_df %>% filter(sex == "male")
+alpha_male$Treatment = factor(alpha_male$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy", "Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx")) #Fix the order on the axis.
+
+ggplot(data = alpha_male) +
+  aes(x = Treatment, y = Shannon, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  #facet_wrap(treatment2~.)+
+  geom_text(aes(label = sample), size = 1.9) +
+  labs(x = NULL, y = "Shannon diversity", title = "Male mice alpha diversity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink"))
+```
+
+Testing significance of CKD, AA use, and ABX.    
+Restructure the metadata a bit.  
+```{r}
+#alpha_male = alpha_male %>% mutate(treatment1 = str_replace(treatment1, "CKD_5/6_nephrectomy", "CKD")) %>% mutate(treatment1 = str_replace(treatment1, "CKD_adenine", "CKD"))
+
+alpha_male = alpha_male %>% mutate(treatment2 = ifelse(is.na(treatment2), "No_HAA", "HAA")) %>% mutate(treatment3 = ifelse(is.na(treatment3), "No_Abx", "Abx"))
+
+alpha_male$treatment1 = as.factor(alpha_male$treatment1)
+alpha_male$treatment2 = as.factor(alpha_male$treatment2)
+alpha_male$treatment3 = as.factor(alpha_male$treatment3)
+```
+
+There is no significant differences across CKD status (Control, CKD, CKD w/ nephrectomy), HAA use, or ABX use after accounting for cage_id.   
+```{r}
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(alpha_male$Shannon)
+alpha_lm$CKD <- as.factor(alpha_male$treatment1) #CKD status
+alpha_lm$HAA <- as.factor(alpha_male$treatment2) #HAA usage
+alpha_lm$ABX <- as.factor(alpha_male$treatment3) #ABX
+alpha_lm$cage <- as.factor(alpha_male$cage_id)
+
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, CKD <- relevel(CKD, "Control"))
+
+summary(lme(x ~ CKD + HAA + ABX, data = alpha_lm, random = list(cage=~1)))
+```
+
+Richness calculations.  
+```{r}
+richness_df = as.data.frame(specnumber(rared_OTU))
+names(richness_df) = "ASV Richness"
+richness_df2 = merge(richness_df, alpha_male, by.x = "row.names", by.y = "Row.names")
+
+ggplot(data = richness_df2) +
+  aes(x = Treatment, y = `ASV Richness`, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  #facet_wrap(treatment2~.)+
+  geom_text(aes(label = sample), size = 1.9) +
+  labs(x = NULL, title = "") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none") +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink"))
+```
+
+There is no significant differences across CKD status (Control, CKD, CKD w/ nephrectomy), HAA use, or ABX use after accounting for cage_id.  
+```{r}
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(richness_df2$`ASV Richness`)
+alpha_lm$CKD <- as.factor(richness_df2$treatment1) #CKD status
+alpha_lm$HAA <- as.factor(richness_df2$treatment2) #HAA usage
+alpha_lm$ABX <- as.factor(richness_df2$treatment3) #ABX
+alpha_lm$cage <- as.factor(richness_df2$cage_id)
+
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, CKD <- relevel(CKD, "Control"))
+
+summary(lme(x ~ CKD + HAA + ABX, data = alpha_lm, random = list(cage=~1)))
+```
+
+### Females and males, assessing CKD  
+Shannon:  
+```{r}
+alpha_both = alpha_df %>% filter(Treatment %in% c("Control", "CKD_adenine", "nephrectomy"))
+alpha_both$Treatment = factor(alpha_both$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy")) #Fix the order on the axis.
+
+ggplot(data = alpha_both) +
+  aes(x = Treatment, y = Shannon, fill = sex) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.6, position = position_dodge(width = .8)) +
+  labs(x = NULL, y = "Shannon diversity", fill = "Sex", title = "Male vs. female") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c( "pink", "lightblue"))
+```
+
+Organized by treatment instead.  
+```{r}
+ggplot(data = alpha_both) +
+  aes(x = sex, y = Shannon, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.6, position = position_dodge(width = .8)) +
+  labs(x = NULL, y = "Shannon diversity", fill = "Treatment", title = "Male vs. female") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4"))
+```
+
+```{r}
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(alpha_both$Shannon)
+alpha_lm$treatment <- as.factor(alpha_both$Treatment) #CKD status
+alpha_lm$sex <- as.factor(alpha_both$sex)
+alpha_lm$cage <- as.factor(alpha_both$cage_id)
+
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, treatment <- relevel(treatment, "Control"))
+
+summary(lme(x ~ treatment*sex, data = alpha_lm, random = list(cage=~1)))
+```
+Using an LME which controls for cage_id, we observe significant differences in the shannon diversity of male and female mice, and control vs. CKD_nephrectomy. There is also a strong interaction with sex and CKD status, most likely driven by the controls within each sex.  
+
+Richness  
+```{r}
+richness_both = merge(richness_df, alpha_both, by.x = "row.names", by.y = "Row.names")
+
+ggplot(data = richness_both) +
+  aes(x = Treatment, y = `ASV Richness`, fill = sex) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.6, position = position_dodge(width = .8)) +
+  labs(x = NULL, fill = "Sex", title = "Male vs. female") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c( "pink", "lightblue"))
+```
+
+Colored by treatment instead
+```{r}
+ggplot(data = richness_both) +
+  aes(x = sex, y = `ASV Richness`, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.6, position = position_dodge(width = .8)) +
+  labs(x = NULL, fill = "Treatment", title = "Male vs. female") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4"))
+```
+
+```{r}
+alpha_lm <- NULL
+alpha_lm$x <- as.numeric(richness_both$`ASV Richness`)
+alpha_lm$treatment <- as.factor(richness_both$Treatment) #CKD status
+alpha_lm$sex <- as.factor(richness_both$sex)
+alpha_lm$cage <- as.factor(richness_both$cage_id)
+
+alpha_lm <- as.data.frame(alpha_lm)
+alpha_lm <- within(alpha_lm, treatment <- relevel(treatment, "Control"))
+
+summary(lme(x ~ treatment*sex, data = alpha_lm, random = list(cage=~1)))
+```
+Using only richness, we do not see statistically significant effects of CKD status or sex on species richness.  
+
+# Beta diversity  
+
+```{r include=FALSE}
+bray_dist = as.data.frame(as.matrix(vegdist(rared_OTU)))
+write.csv(bray_dist, file = "Bray_dist_matrix.csv", quote = F)
+
+rared_OTU_merge = merge(metadata, rared_OTU, by.x = "sampleid", by.y = "row.names")
+OTU_males = rared_OTU_merge %>% filter(sex == "male") %>% column_to_rownames(var = "sampleid")
+MDS_out1 = metaMDS(OTU_males[,(ncol(metadata)+1):ncol(OTU_males)], trymax = 999, parallel = 32)
+MDS_points1 = as.data.frame(MDS_out1$points) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+MDS_points1$Treatment = factor(MDS_points1$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy", "Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx"))
+```
+
+```{r}
+ggplot(data = MDS_points1) +
+  aes(x = MDS1, y= MDS2, fill = Treatment) +
+  geom_point(pch = 21, size = 2) +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  scale_color_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  labs(title = "Males only") +
+  stat_ellipse(aes(color = Treatment)) +
+  annotate("text", x = 5, y = -7, size = 4, label = bquote("Stress ="~.(round(MDS_out1$stress, digits = 2))))
+```
+
+### PERMANOVA of males only.  
+```{r}
+perma_df = OTU_males %>% mutate(treatment2 = ifelse(is.na(treatment2), "No_HAA", "HAA")) %>% mutate(treatment3 = ifelse(is.na(treatment3), "No_Abx", "Abx"))
+
+perma_df$treatment1 = as.factor(perma_df$treatment1) #CKD
+perma_df$treatment2 = as.factor(perma_df$treatment2) #HAA
+perma_df$treatment3 = as.factor(perma_df$treatment3) #ABX
+perma_df$cage_id = as.factor(perma_df$cage_id)
+perma_df = perma_df %>% filter(!cage_id %in% c("208758", "208757", "208756", "187026")) #single mice per cage
+
+adonis(formula = perma_df[,(ncol(metadata)+1):ncol(perma_df)] ~ cage_id, data = perma_df, method = "bray", parallel = 32)
+```
+A single factor PERMANOVA of cage_id only in males shows 82% of variance explained in the microbiome.  
+
+```{r}
+adonis(formula = perma_df[,(ncol(metadata)+1):ncol(perma_df)] ~ treatment3 + treatment2 + treatment1 + cage_id, data = perma_df, method = "bray", parallel = 32)
+```
+This is reduced to 43% after including CKD status (treatment1), HAA use (treatment2), and ABX use (treatment3).  
+
+**note (11/02/21): Order of operation of treatments 1-3 changes the percent of variance, indicating that the order matters and that the effects are not completely independent. This makes sense because ABX usage is only ever used alongside HAA usage.  **  
+
+### Both males and females, assessing CKD status
+```{r include=FALSE}
+OTU_both = rared_OTU_merge %>% filter(Treatment %in% c("Control", "CKD_adenine", "nephrectomy")) %>% column_to_rownames(var = "sampleid")
+
+MDS_out2 = metaMDS(OTU_both[,(ncol(metadata)+1):ncol(OTU_both)], trymax = 999, parallel = 32)
+```
+
+NMDS by treatment and sex.  
+```{r}
+MDS_points2 = as.data.frame(MDS_out2$points) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+
+MDS_points2$Treatment = factor(MDS_points2$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy"))
+
+ggplot(data = MDS_points2) +
+  aes(x = MDS1, y= MDS2, fill = Treatment, pch = sex) +
+  geom_point(size = 2) +
+  theme_bw() +
+  labs(pch = "Sex", color = "Sex", title = "Males and females") +
+  scale_shape_manual(values = c(21,24)) +
+  scale_color_manual(values = c("pink", "lightblue")) +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4")) +
+  guides(color = F, fill = guide_legend(override.aes = list(shape = 21))) +
+  stat_ellipse(aes(color = sex)) +
+  annotate("text", x = .4, y = 1, size = 4, label = bquote("Stress ="~.(round(MDS_out2$stress, digits = 2))))
+```
+
+NMDS to visualize cohort and cage effects.  
+```{r}
+ggplot(data = MDS_points2) +
+  aes(x = MDS1, y= MDS2) +
+  geom_point(aes(color = as.factor(cage_id), pch = collection_timestamp), size = 2) +
+  theme_bw() +
+  labs(pch = "Cohort", lty = "Cohort", color = "Cage ID") +
+  stat_ellipse(aes(lty = collection_timestamp)) 
+  #annotate("text", x = .4, y = 1, size = 4, label = bquote("Stress ="~.(round(MDS_out2$stress, digits = 2))))
+```
+
+PERMANOVAs
+```{r}
+perma_df2 = OTU_both %>% mutate(treatment2 = ifelse(is.na(treatment2), "No_HAA", "HAA")) %>% mutate(treatment3 = ifelse(is.na(treatment3), "No_Abx", "Abx"))
+
+perma_df2$treatment1 = as.factor(perma_df2$treatment1) #CKD
+perma_df2$cage_id = as.factor(perma_df2$cage_id)
+perma_df2 = perma_df2 %>% filter(!cage_id %in% c("208758", "208757", "208756", "187026")) #One mice per cage only
+
+adonis(formula = perma_df2[,(ncol(metadata)+1):ncol(perma_df2)] ~ cage_id, data = perma_df2, method = "bray", parallel = 32)
+```
+For both males and females, a single factor PERMANOVA significantly explains ~77% of variance in the microbiome.  
+
+```{r}
+adonis(formula = perma_df2[,(ncol(metadata)+1):ncol(perma_df2)] ~ sex + treatment1 + cage_id, data = perma_df2, method = "bray", parallel = 32)
+```
+Treatment (CKD status) significantly explains ~23% of the variance while sex explains ~5% of the variance.  
+Cage drops to 51% variance when including treatment and sex.  
+
+**Notes (11/4/21): Switching sex and treatment does not change the proportion of variance of each**
+
+```{r}
+adonis(formula = perma_df2[,(ncol(metadata)+1):ncol(perma_df2)] ~ (sex*treatment1), data = perma_df2, method = "bray", parallel = 32)
+```
+As with alpha diversity, the interaction between sex and treatment is significant, suggesting males/female microbiomes may respond differently to CKD.  
+
+Cage ID is ommitted here because the PERMANOVA fails otherwise.  
+
+### Taxonomy barplot
+
+```{r fig.width = 20, fig.height =  12, warning = FALSE}
+relab_table <- decostand(rared_OTU, method = "total", MARGIN = 1)
+
+barplot_df <- reshape2::melt(as.matrix(relab_table)) %>% merge(taxonomy, ., by.x = "row.names", by.y = "Var2") %>% mutate(Taxon = gsub(".__", "", .$Taxon)) %>% tidyr::separate(., col = Taxon, into = c("L1","L2","L3","L4","L5","L6","L7"), sep = "; ", remove = T, extra = "drop") %>% mutate_all(na_if,"")
+
+barplot_df$value <- as.numeric(barplot_df$value)
+
+#Taxonomy level of interest
+barplot_df <- rename(barplot_df, taxonomy = L6)
+  
+#Take top 10
+top_taxa <- group_by(barplot_df, taxonomy) %>% summarise(., top_taxa_tmp = sum(value)) %>% arrange(., desc(top_taxa_tmp)) %>% slice(., 1:12)
+high_abundance <- split(top_taxa$taxonomy, 1:NROW(top_taxa)) 
+high_abundance <- high_abundance[!is.na(high_abundance)]
+
+#Replace not top 10 with other. 
+barplot_df$taxonomy[barplot_df$taxonomy %in% high_abundance != "TRUE"] <- "Other"
+barplot_df$taxonomy[barplot_df$taxonomy %in% "uncultured" == "TRUE"] <- "Other"
+barplot_df2 <- aggregate(barplot_df$value, by=list(taxonomy=barplot_df$taxonomy, Var1 = barplot_df$Var1), FUN=sum) %>% merge(., metadata, by.x = "Var1", by.y = "sampleid")
+
+barplot_df2 <- barplot_df2[order(barplot_df2$taxonomy),] #Re order
+barplot_df2 <- rbind(barplot_df2[!(barplot_df2$taxonomy == "Other"),],barplot_df2[(barplot_df2$taxonomy == "Other"),]) #Move other to bottom
+barplot_df2$taxonomy <- factor(barplot_df2$taxonomy, levels = unique(barplot_df2$taxonomy)) #Fix the order
+
+#Custom color pallette.
+julio_color <- c("#003f5c", "#665191", "#d45087", "#ff7c43","#ffa600", "#7F0A57", "#CD9ABB", "#39A9AB", "#71CFC5", "#007947" ,"gray")
+
+barplot = ggplot(data = barplot_df2, aes(x = Var1, weight = x, fill = taxonomy)) +
+  geom_bar(width = 1, color = "black", size = .2) +
+  theme_classic() +
+  facet_grid(.~sex+Treatment, space = "free", scales = "free") +
+  scale_fill_manual(values = julio_color) +
+  theme(axis.text.x=element_text(angle = 90, size = 5), strip.text.x = element_text(size = 6), strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Relative abundance", fill = "Genus")
+barplot
+
+ggsave("Microbiome_plot.svg", plot = barplot, device = "svg", dpi = 600, width = 13, height = 5)
+```
+
+# New analysis (November 4th, 2021)
+
+## Notes:
+
+1. Check metadata - **completed**.  
+![](Screenshot from 2021-11-03 20-14-00.png)  
+2. Explore whether to change rarefaction depth so the 8 samples stay in the analysis (if appropriate in terms of sequence number) - 8 samples fall out, all in Abx treatment group, and all from same cage (need to double check metadata) - **The rarefaction depth was reduced to 4,300 reads as oppposed to 35,000. No change in statistical significance was observed, but we did reduce the total number of ASVs observed**.  
+3. Some of the Abx treated mice have high diversity, unexpected, and they are from cages 280255 and 280254 and one sample from 29450 - **The points on the diversity plots are now labeled by mouse to help with this**.  
+4. Identify which Abx treated animals have high and low diversity on the taxa barplot - **A new barplot subsetted with the ABX treated animals has been generated**.  
+5. Separate NMDS with top 3 treatments males only, and bottom 4 treatments. - **Completed. Additionally, eigen vectors were added to the ordination plots to see which taxa are driving seperate clusters**.  
+6. Run beta disper in vegan to check for dispersion differences - **completed**
+7. Check order of operations in permanova - **Completed. See the bold notes under the PERMANOVAs. Cage ID could not be moved from the last position because moving it before treatment, HAA use, and ABX use would cause the PERMANOVA to fail. This suggest that treatment, HAA use, and ABX use is dependent on cage ID**.  
+8. List of bugs that are proteolytic and saccharolytic. - **Please provide a specific list**
+9. Are there any treatment associated bugs independent of cage associated bugs? - **[Linear decomposition model](https://academic.oup.com/bioinformatics/article/36/14/4106/5823298) seems to suggest there is a significant effect associated with sex, treatment, AA and ABX usage. This test does not give the proportion of variance but larger effect sizes generate higher F statistics. The next step is to identify differentially abundant OTUs. **
+10. Send table with diversity indices (Shannon diversity)
+11. Nephrectomy microbiomes nice and tightly clustered - compare with metabolome/toxin analysis (Wei Ling will do this)
+
+## ABX taxonomy barplot
+```{r}
+ABX_relab = merge(metadata, relab_table, by.x = "sampleid", by.y = "row.names") %>% filter(treatment3 == "Abx") %>% column_to_rownames(var = "sampleid") %>% select(!`Barcodes-seq`:tube_id)
+
+Abx_barplot_df <- reshape2::melt(as.matrix(ABX_relab)) %>% merge(taxonomy, ., by.x = "row.names", by.y = "Var2") %>% mutate(Taxon = gsub(".__", "", .$Taxon)) %>% tidyr::separate(., col = Taxon, into = c("L1","L2","L3","L4","L5","L6","L7"), sep = "; ", remove = T, extra = "drop") %>% mutate_all(na_if,"")
+
+Abx_barplot_df$value <- as.numeric(Abx_barplot_df$value)
+
+#Taxonomy level of interest
+Abx_barplot_df <- rename(Abx_barplot_df, taxonomy = L5)
+  
+#Take top 10
+top_taxa <- group_by(Abx_barplot_df, taxonomy) %>% summarise(., top_taxa_tmp = sum(value)) %>% arrange(., desc(top_taxa_tmp)) %>% slice(., 1:11)
+high_abundance <- split(top_taxa$taxonomy, 1:NROW(top_taxa)) 
+high_abundance <- high_abundance[!is.na(high_abundance)]
+
+#Replace not top 10 with other. 
+Abx_barplot_df$taxonomy[Abx_barplot_df$taxonomy %in% high_abundance != "TRUE"] <- "Other"
+Abx_barplot_df$taxonomy[Abx_barplot_df$taxonomy %in% "uncultured" == "TRUE"] <- "Other"
+Abx_barplot_df2 <- aggregate(Abx_barplot_df$value, by=list(taxonomy=Abx_barplot_df$taxonomy, Var1 = Abx_barplot_df$Var1), FUN=sum) %>% merge(., metadata, by.x = "Var1", by.y = "sampleid")
+
+Abx_barplot_df2 <- Abx_barplot_df2[order(Abx_barplot_df2$taxonomy),] #Re order
+Abx_barplot_df2 <- rbind(Abx_barplot_df2[!(Abx_barplot_df2$taxonomy == "Other"),],Abx_barplot_df2[(Abx_barplot_df2$taxonomy == "Other"),]) #Move other to bottom
+Abx_barplot_df2$taxonomy <- factor(Abx_barplot_df2$taxonomy, levels = unique(Abx_barplot_df2$taxonomy)) #Fix the order
+
+#Custom color pallette.
+julio_color <- c("#003f5c", "#665191", "#d45087", "#ff7c43","#ffa600", "#7F0A57", "#CD9ABB", "#39A9AB", "#71CFC5", "#007947" ,"gray")
+
+ggplot(data = Abx_barplot_df2, aes(x = sample, weight = x, fill = taxonomy)) +
+  geom_bar(width = 1, color = "black", size = .2) +
+  theme_classic() +
+  facet_grid(.~Treatment, space = "free", scales = "free") +
+  scale_fill_manual(values = julio_color) +
+  theme(axis.text.x=element_text(angle = 45, hjust = 1), strip.text.x = element_text(size = 6), strip.background = element_rect(fill="white")) +
+  labs(x = NULL, y = "Relative abundance", fill = "Family")
+```
+
+Print out of metadata to track cage_id for antibiotic treated mice:  
+```{r}
+metadata %>% filter(treatment3 == "Abx") %>% select(sample, cage_id, treatment3)
+```
+
+## Males separated by top 3 and bottom 4 treatments.  
+
+Top 3 treatments males only.  
+```{r include=FALSE}
+OTU_males_top3 = rared_OTU_merge %>% filter(Treatment %in% c("Control", "CKD_adenine", "nephrectomy"), sex == "male") %>% column_to_rownames(var = "sampleid")
+MDS_out3 = metaMDS(OTU_males_top3[,(ncol(metadata)+1):ncol(OTU_males_top3)], trymax = 999, parallel = 32)
+MDS_points3 = as.data.frame(MDS_out3$points) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+MDS_points3$Treatment = factor(MDS_points3$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy"))
+
+Envfit_df = barplot_df %>% group_by(L5, Var1) %>% summarise(total = sum(value)) %>% reshape2::dcast(formula = Var1~L5) %>% column_to_rownames(var = "Var1")
+
+males_envfit = MDS_points3 %>% merge(., Envfit_df, by.x = "Row.names", by.y = "row.names") %>% select((ncol(MDS_points3)+1):ncol(.)) %>% envfit(ord = MDS_out3, env = .)
+
+males_envfit2 = as.data.frame(scores(males_envfit, display = "vectors")) %>% rownames_to_column()
+```
+
+Without labels.  
+```{r}
+ggplot(data = MDS_points3) +
+  aes(x = MDS1, y= MDS2, fill = Treatment) +
+  geom_segment(data = males_envfit2, aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2), arrow = arrow(length = unit(0.25, "cm")), colour = "gray", inherit.aes = F) +
+  #geom_text(data = males_envfit2, aes(x = NMDS1, y = NMDS2+.05, label = as.character(rowname)), inherit.aes = F, size = 3, alpha = 0.5) +
+  geom_point(pch = 21, size = 2) +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  scale_color_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  stat_ellipse(aes(color = Treatment)) +
+  labs(title = "Males only")
+  #annotate("text", x = 5, y = -7, size = 4, label = bquote("Stress ="~.(round(MDS_out1$stress, digits = 2))))
+```
+
+With labels.  
+```{r}
+ggplot(data = MDS_points3) +
+  aes(x = MDS1, y= MDS2, fill = Treatment) +
+  geom_segment(data = males_envfit2, aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2), arrow = arrow(length = unit(0.25, "cm")), colour = "gray", inherit.aes = F) +
+  geom_text(data = males_envfit2, aes(x = NMDS1, y = NMDS2+.05, label = as.character(rowname)), inherit.aes = F, size = 3, alpha = 0.5) +
+  geom_point(pch = 21, size = 2) +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  scale_color_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  stat_ellipse(aes(color = Treatment)) +
+  labs(title = "Males only")
+  #annotate("text", x = 5, y = -7, size = 4, label = bquote("Stress ="~.(round(MDS_out1$stress, digits = 2))))
+```
+
+Bottom 4 treatments males only.  
+```{r include=FALSE}
+OTU_males_bottom4 = rared_OTU_merge %>% filter(Treatment %in% c("Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx")) %>% column_to_rownames(var = "sampleid")
+MDS_out4 = metaMDS(OTU_males_bottom4[,(ncol(metadata)+1):ncol(OTU_males_bottom4)], trymax = 999, parallel = 32)
+MDS_points4 = as.data.frame(MDS_out4$points) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+MDS_points4$Treatment = factor(MDS_points4$Treatment, levels = c("Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx"))
+
+males_envfit3 = MDS_points4 %>% merge(., Envfit_df, by.x = "Row.names", by.y = "row.names") %>% select((ncol(MDS_points4)+1):ncol(.)) %>% envfit(ord = MDS_out4, env = .)
+
+males_envfit4 = as.data.frame(scores(males_envfit3, display = "vectors")) %>% rownames_to_column()
+```
+
+Without labels.  
+```{r}
+ggplot(data = MDS_points4) +
+  aes(x = MDS1, y= MDS2, fill = Treatment) +
+  geom_segment(data = males_envfit4, aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2), arrow = arrow(length = unit(0.25, "cm")), colour = "gray", inherit.aes = F) +
+  #geom_text(data = males_envfit4, aes(x = NMDS1, y = NMDS2+.05, label = as.character(rowname)), inherit.aes = F, size = 2.5, alpha = 0.25) +
+  geom_point(pch = 21, size = 2) +
+  theme_bw() +
+  scale_fill_manual(values = c("purple", "salmon", "steelblue", "pink")) +
+  scale_color_manual(values = c("purple", "salmon", "steelblue", "pink")) +
+  stat_ellipse(aes(color = Treatment), inherit.aes = T) +
+  labs(title = "Males only") +
+  annotate("text", x = 3, y = 3, size = 4, label = bquote("Stress ="~.(round(MDS_out4$stress, digits = 2))))
+```
+
+With labels.  
+```{r}
+ggplot(data = MDS_points4) +
+  aes(x = MDS1, y= MDS2, fill = Treatment) +
+  geom_segment(data = males_envfit4, aes(x = 0, xend = NMDS1, y = 0, yend = NMDS2), arrow = arrow(length = unit(0.25, "cm")), colour = "gray", inherit.aes = F) +
+  geom_text(data = males_envfit4, aes(x = NMDS1, y = NMDS2+.05, label = as.character(rowname)), inherit.aes = F, size = 2.5, alpha = 0.25) +
+  geom_point(pch = 21, size = 2) +
+  theme_bw() +
+  scale_fill_manual(values = c("purple", "salmon", "steelblue", "pink")) +
+  scale_color_manual(values = c("purple", "salmon", "steelblue", "pink")) +
+  stat_ellipse(aes(color = Treatment), inherit.aes = T) +
+  labs(title = "Males only") +
+  annotate("text", x = 3, y = 3, size = 4, label = bquote("Stress ="~.(round(MDS_out4$stress, digits = 2))))
+```
+
+## Beta dispersion
+Beta dispersion of treatment within males only.  
+```{r}
+bray_males_only = vegdist(OTU_males[,(ncol(metadata)+1):ncol(OTU_males)], method = "bray")
+bray_males_merge = merge(metadata, as.matrix(bray_males_only), by.x = "sampleid", by.y = "row.names")
+
+centroid_males = betadisper(bray_males_only, group = bray_males_merge$Treatment, type = c("median","centroid"), bias.adjust = FALSE, sqrt.dist = FALSE, add = FALSE)
+centroid_males_merge <- as.data.frame(centroid_males$distances) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+centroid_males_merge$Treatment = factor(centroid_males_merge$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy", "Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx"))
+
+ggplot(data = centroid_males_merge) + 
+  aes(x = Treatment, y = `centroid_males$distances`, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.9) +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4", "purple", "salmon", "steelblue", "pink")) +
+  labs(x = NULL, y = "Distance from centroid", title = "Beta dispersion (Bray-Curtis)") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+A higher value indicates that the samples are more dissimilar to each other.  
+
+Female and male beta dispersion.  
+```{r}
+bray_both = vegdist(OTU_both[,(ncol(metadata)+1):ncol(OTU_both)], method = "bray")
+bray_both_merge = merge(metadata, as.matrix(bray_both), by.x = "sampleid", by.y = "row.names")
+
+centroid_both = betadisper(bray_both, group = bray_both_merge$Treatment, type = c("median","centroid"), bias.adjust = FALSE, sqrt.dist = FALSE, add = FALSE)
+centroid_both_merge <- as.data.frame(centroid_both$distances) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+centroid_both_merge$Treatment = factor(centroid_both_merge$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy"))
+
+ggplot(data = centroid_both_merge) + 
+  aes(x = sex, y = `centroid_both$distances`, fill = Treatment) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_text(aes(label = sample), size = 1.9, position = position_dodge(width = .8)) +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue", "forestgreen", "darkorange4")) +
+  labs(x = NULL, y = "Distance from centroid", title = "Beta dispersion (Bray-Curtis)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Significance testing after removing cage effects
+
+Males only
+```{r}
+rared_OTU_merge1 = rared_OTU_merge %>% filter(sex == "male") %>% column_to_rownames(var = "sampleid")
+
+ldm_OTU1 = rared_OTU_merge1[,ncol(metadata):ncol(rared_OTU_merge1)]
+
+ldm_meta1 = rared_OTU_merge1[,1:(ncol(metadata)-1)]
+ldm_meta1$HAA_usage = as.character(ldm_meta1$treatment2)
+ldm_meta1$ABX_usage = as.character(ldm_meta1$treatment3)
+ldm_meta1 = ldm_meta1 %>% replace_na(list(HAA_usage = 'noAA', ABX_usage = 'noabx'))
+
+test_ldm = permanovaFL(formula = ldm_OTU1|cage_id ~ ABX_usage + HAA_usage + treatment1, data = ldm_meta1, dist.method = "bray")
+test_ldm
+```
+The p values are in order according to the formula. It's fine that they all have the same p-value. According to this statistical test: treatment, AA use, and abx use were all significantly associated with the microbiome when accounting for cage ID. The amount of variance is not obtainable using this method.  
+
+Males and females, assessing treatment only
+```{r}
+rared_OTU_merge2 = rared_OTU_merge %>% filter(Treatment %in% c("Control", "CKD_adenine", "nephrectomy")) %>% column_to_rownames(var = "sampleid")
+
+ldm_OTU2 = rared_OTU_merge2[,ncol(metadata):ncol(rared_OTU_merge2)]
+ldm_meta2 = rared_OTU_merge2[,1:(ncol(metadata)-1)]
+
+test_ldm2 = permanovaFL(formula = ldm_OTU2|cage_id ~ sex + treatment1, data = ldm_meta2, dist.method = "bray")
+test_ldm2
+```
+Like before, treatment and sex are significantly associated with the microbiome. No variance again, but you can gauge the effect size through the F statistic.
+
+```{r include=FALSE}
+write.table(x = diversity(rared_OTU), file = "Shannon_diversities", quote = F, sep = "\t", col.names = F)
+```
+
+```{r eval=FALSE, include=FALSE}
+cov_adj_dm = adjust.data.by.covariates(formula = ~cage_id, data = rared_OTU_merge1[,1:(ncol(metadata)-1)], otu.table = rared_OTU_merge1[,ncol(metadata):ncol(rared_OTU_merge1)], dist.method = "bray")
+adj_pcoa = cmdscale(cov_adj_dm$adj.dist, eig = T, k = nrow(rared_OTU_merge1[,ncol(metadata):ncol(rared_OTU_merge1)])-1, add = T)
+adj_eig = eigenvals(adj_pcoa)
+pcoa_var = (adj_eig[1:3]/sum(adj_eig))*100 #About 1% variance on each axis, not much
+adj_df = as.data.frame(adj_pcoa$points[,1:2]) %>% magrittr::set_rownames(rownames(rared_OTU_merge1)) %>% merge(., metadata, by.x = "row.names", by.y = "sampleid")
+
+
+ggplot(data = adj_df) +
+geom_text(aes(label = sample, x = V1, y = V2, color = treatment1), size = 3)
+```
+
+# Specific taxa
+
+Proteolytic bacteria
+```{r}
+Sacc_list = c("Corynebacteriaceae", "Lactobacillaceae", "Porphyromonadaceae", "Prevotellaceae", "Rikenellaceae", "Lachnospiraceae", "Ruminococcaceae", "Verrucomicrobiaceae", "Erysipelotrichales", "Gemmatimonadetes","Mollicutes", "Spirochaetes")
+
+Proteo_list = c("Alphaproteobacteria", "Betaproteobacteria", "Deltaproteobacteria", "Gammaproteobacteria", "Escherichia", "Klebsiella", "Moraxellaceae", "Pseudomonadaceae")
+
+merged_OTU_taxonomy = merge(taxonomy, t(rared_OTU), by = "row.names") %>% select(!c("Confidence","Row.names")) %>% reshape2::melt(.)
+
+metadata$Treatment = factor(metadata$Treatment, levels = c("Control", "CKD_adenine", "nephrectomy", "Control_HAA", "CKD_adenine_HAA","Control_HAA_Abx", "CKD_adenine_HAA_Abx")) 
+
+Sacc_DFs = list()
+
+for (i in 1:length(Sacc_list)) {
+  tmp = merged_OTU_taxonomy %>% filter(grepl(Sacc_list[i], .$Taxon)) %>% mutate(Taxon = Sacc_list[i]) %>% 
+    group_by(variable) %>% summarise(sum = sum(value)) %>% merge(., metadata, by.x = "variable", by.y = "sampleid")
+  Sacc_DFs[[length(Sacc_DFs)+1]] = tmp
+}
+
+Sacc_plots = list()
+
+for (i in 1:length(Sacc_DFs)) {
+  tmp = ggplot(data = as.data.frame(Sacc_DFs[i])) +
+    aes(x = Treatment, y = sum, fill = sex) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(position = position_jitterdodge(), size = 0.5) +
+    labs(x = NULL, y = "Normalized reads", title = Sacc_list[i], Fill = "Sex") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+  Sacc_plots[[length(Sacc_plots)+1]] = tmp
+}
+```
+
+## Sacchrolytic bacteria.  
+The blue is males and the pink is females.  
+
+```{r fig.width= 8, fig.height= 9}
+ggarrange(plotlist = Sacc_plots[-c(8,10,11,12)])
+```
+
+```{r}
+Prot_DFs = list()
+
+for (i in 1:length(Proteo_list)) {
+  tmp = merged_OTU_taxonomy %>% filter(grepl(Proteo_list[i], .$Taxon)) %>% mutate(Taxon = Proteo_list[i]) %>% 
+    group_by(variable) %>% summarise(sum = sum(value)) %>% merge(., metadata, by.x = "variable", by.y = "sampleid")
+  Prot_DFs[[length(Prot_DFs)+1]] = tmp
+}
+
+Prot_plots = list()
+
+for (i in 1:length(Prot_DFs)) {
+  tmp = ggplot(data = as.data.frame(Prot_DFs[i])) +
+    aes(x = Treatment, y = sum, fill = sex) +
+    geom_boxplot(outlier.shape = NULL) +
+    geom_point(position = position_jitterdodge()) +
+    labs(x = NULL, y = "Normalized reads", title = Sacc_list[i], Fill = "Sex") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+  Prot_plots[[length(Prot_plots)+1]] = tmp
+}
+```
+
+## Proteolytic bacteria.  
+The blue is males and the pink is females.  
+
+```{r fig.width= 8, fig.height= 6}
+ggarrange(plotlist = Prot_plots[-c(2,3)])
+```
