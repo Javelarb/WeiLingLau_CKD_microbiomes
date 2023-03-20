@@ -13,3 +13,4 @@ Additionally, there are the following files are included:
 * Filtered_rarefied_4300_ASV_table.tsv - The same file as Filtered_ASV_table.tsv but rarfied to 4300 reads.
 * Filtered_rarefied_1700_species_table.tsv - The same file as Filtered_species_table.tsv but rarfied to 1700 reads.
 * Filtered_rarefied_3700_genus_table.tsv - The same file as Filtered_Genus_table.tsv but rarfied to 3700 reads.
+* feature-table.biom - The raw ASV table produced from Qiime2.
